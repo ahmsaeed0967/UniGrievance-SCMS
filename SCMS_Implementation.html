@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SCMS - Student & Admin Portal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styling for a polished look */
+        body { font-family: 'Inter', sans-serif; }
+        .card { transition: all 0.3s ease-in-out; }
+        
+        /* Status Badge Colors for Admin Table */
+        .status-pending { @apply bg-yellow-100 text-yellow-800; }
+        .status-progress { @apply bg-blue-100 text-blue-800; }
+        .status-resolved { @apply bg-green-100 text-green-800; }
+        .status-rejected { @apply bg-red-100 text-red-800; }
+    </style>
+
+    <script type="module">
+        import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
+        // Global variables
+        window.supabase = null;
+        window.userId = null;
+        window.userEmail = null; 
+        window.userName = null;  
+        window.isAdmin = false; 
+        window.allComplaintsCache = []; 
+
+        // --- SUPABASE CONFIGURATION ---
+        const SUPABASE_URL = "https://xqlzemqmurcghzwtsdal.supabase.co";
+        const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhxbHplbXFtdXJjZ2h6d3RzZGFsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE4OTExMTMsImV4cCI6MjA3NzQ2NzExM30.h_4IO8efxzC2KVvpActo6Lg4LuWSBS7DWs2c_WAP3oY";
+
+        // --- UTILS ---
+        
+        window.validateStudentId = function(id) {
+            const regex = /^[1-9][0-9]I-\d{4}$/;
+            if (!regex.test(id)) return false;
+            const lastFour = id.split('-')[1];
+            if (lastFour === '0000') return false;
+            return true;
+        };
+
+        // --- CORE AUTH & SETUP ---
+
+        window.setupSupabase = async function() {
+            try {
+                window.supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+                // Auth State Listener
+                window.supabase.auth.onAuthStateChange((event, session) => {
+                    document.getElementById('loading-overlay').classList.add('hidden');
+                    
+                    if (session) {
+                        window.userId = session.user.id;
+                        
+                        // Check for Admin Metadata & User Details
+                        const metadata = session.user.user_metadata || {};
+                        window.isAdmin = metadata.is_admin === true;
+                        
+                        // Capture Name and Email from session
+                        window.userEmail = session.user.email;
+                        window.userName = metadata.full_name || 'Student';
+
+                        console.log(`User logged in. ID: ${window.userId}, Name: ${window.userName}`);
+
+                        if (window.isAdmin) {
+                            // Admin Logic
+                            document.getElementById('header-user-id').textContent = 'Administrator';
+                            document.getElementById('admin-nav-links').classList.remove('hidden');
+                            document.getElementById('student-nav-links').classList.add('hidden');
+                            window.showView('admin-dashboard');
+                        } else {
+                            // Student Logic
+                            // NEW: Update Header to show Name and Email
+                            const displayText = `${window.userName} (${window.userEmail})`;
+                            document.getElementById('header-user-id').textContent = displayText;
+                            
+                            document.getElementById('display-user-id').textContent = window.userId;
+                            document.getElementById('admin-nav-links').classList.add('hidden');
+                            document.getElementById('student-nav-links').classList.remove('hidden');
+                            window.showView('complaint-form');
+                        }
+
+                        // Common UI updates
+                        document.getElementById('login-register-links').classList.add('hidden');
+                        document.getElementById('user-actions-links').classList.remove('hidden');
+
+                    } else {
+                        // Logged out
+                        window.userId = null;
+                        window.userEmail = null;
+                        window.userName = null;
+                        window.isAdmin = false;
+                        document.getElementById('login-register-links').classList.remove('hidden');
+                        document.getElementById('user-actions-links').classList.add('hidden');
+                        window.showView('login');
+                    }
+                });
+
+                // Initial Session Check
+                const { data: { session } } = await window.supabase.auth.getSession();
+                if (!session) {
+                     document.getElementById('loading-overlay').classList.add('hidden');
+                     window.showView('login');
+                }
+
+            } catch (error) {
+                console.error("Supabase setup error:", error.message);
+                document.getElementById('loading-message').textContent = `Setup Error: ${error.message}`;
+            }
+        };
+
+        window.addEventListener('load', window.setupSupabase);
+
+        // --- VIEW NAVIGATION ---
+        window.showView = function(viewId) {
+            if (viewId === 'admin-dashboard' && !window.isAdmin) {
+                console.warn("Access Denied: Student attempted to view Admin Dashboard");
+                return;
+            }
+
+            document.querySelectorAll('.app-view').forEach(view => view.classList.add('hidden'));
+            document.getElementById(viewId).classList.remove('hidden');
+
+            if (viewId === 'view-complaints' && !window.isAdmin) {
+                window.handleViewComplaints(); 
+            } else if (viewId === 'admin-dashboard' && window.isAdmin) {
+                window.loadAllComplaints(); 
+            }
+        }
+
+        // --- AUTH HANDLERS ---
+
+        window.handleLogin = async function(event) {
+            event.preventDefault();
+            const messageBox = document.getElementById('login-message');
+            messageBox.innerHTML = '';
+
+            const loginInput = document.getElementById('login-id').value.trim();
+            const password = document.getElementById('login-password').value;
+            
+            let email = loginInput;
+            
+            if (!loginInput.includes('@')) {
+                if (!window.validateStudentId(loginInput)) {
+                    messageBox.innerHTML = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative">Invalid format. Use Student ID (22I-1234) or Admin Email.</div>';
+                    return;
+                }
+                email = `${loginInput}@student.university.edu`;
+            }
+
+            try {
+                const { data, error } = await window.supabase.auth.signInWithPassword({
+                    email: email,
+                    password: password,
+                });
+
+                if (error) throw error;
+                messageBox.innerHTML = '<div class="bg-green-100 text-green-700 px-4 py-3 rounded">Login Successful...</div>';
+
+            } catch (error) {
+                messageBox.innerHTML = `<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative">${error.message}</div>`;
+            }
+        }
+
+        window.handleRegister = async function(event) {
+            event.preventDefault();
+            const messageBox = document.getElementById('register-message');
+            messageBox.innerHTML = '';
+
+            const studentId = document.getElementById('reg-id').value.trim();
+            const password = document.getElementById('reg-password').value;
+            const fullName = document.getElementById('reg-name').value.trim();
+
+            if (!window.validateStudentId(studentId)) {
+                messageBox.innerHTML = '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative">Invalid Student ID format.</div>';
+                return;
+            }
+
+            try {
+                const email = `${studentId}@student.university.edu`;
+                const { data, error } = await window.supabase.auth.signUp({
+                    email: email,
+                    password: password,
+                    options: { data: { full_name: fullName, student_id: studentId } }
+                });
+
+                if (error) throw error;
+                messageBox.innerHTML = '<div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative">Registration successful! Please log in.</div>';
+                document.getElementById('register-form-content').reset();
+                setTimeout(() => { window.showView('login'); }, 2000);
+
+            } catch (error) {
+                messageBox.innerHTML = `<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative">${error.message}</div>`;
+            }
+        }
+
+        window.logOut = async function() {
+             await window.supabase.auth.signOut();
+        }
+
+        // --- STUDENT FEATURES ---
+
+        window.handleSubmitComplaint = async function(event) {
+            event.preventDefault();
+            const form = document.getElementById('complaint-form-content');
+            const title = form.querySelector('#complaintTitle').value.trim();
+            const category = form.querySelector('#complaintCategory').value;
+            const description = form.querySelector('#complaintDescription').value.trim();
+            const messageBox = document.getElementById('complaint-message');
+
+            if (description.length < 50) {
+                 messageBox.innerHTML = '<div class="bg-red-100 text-red-700 px-4 py-3 rounded">Description too short (min 50 chars).</div>';
+                return;
+            }
+
+            const complaintId = 'CMP-' + crypto.randomUUID().split('-')[0].toUpperCase();
+            
+            try {
+                const { error } = await window.supabase.from('complaints').insert([{
+                    complaint_id: complaintId,
+                    title: title,
+                    category: category,
+                    description: description,
+                    status: 'Pending Review',
+                    user_id: window.userId,
+                    student_name: window.userName,
+                    student_email: window.userEmail,
+                    submitted_at: new Date().toISOString()
+                }]);
+
+                if (error) throw error;
+
+                messageBox.innerHTML = `<div class="bg-green-100 text-green-700 px-4 py-3 rounded">Complaint Submitted. ID: <strong>${complaintId}</strong></div>`;
+                form.reset();
+            } catch (e) {
+                messageBox.innerHTML = `<div class="bg-red-100 text-red-700 px-4 py-3 rounded">Error: ${e.message}</div>`;
+            }
+        };
+
+        window.deleteComplaint = async function(uuid) {
+            if (!confirm("Are you sure you want to delete this complaint? This action cannot be undone.")) {
+                return;
+            }
+
+            const listContainer = document.getElementById('complaints-list-container');
+            
+            try {
+                const { error } = await window.supabase
+                    .from('complaints')
+                    .delete()
+                    .eq('id', uuid)
+                    .eq('user_id', window.userId); 
+
+                if (error) throw error;
+
+                alert("Complaint deleted successfully.");
+                window.handleViewComplaints(); 
+
+            } catch (e) {
+                alert("Error deleting complaint: " + e.message);
+                console.error(e);
+            }
+        };
+
+        window.handleViewComplaints = async function() {
+            const listContainer = document.getElementById('complaints-list-container');
+            listContainer.innerHTML = '<div class="text-center py-8 text-gray-500">Loading complaints...</div>';
+
+            try {
+                const { data, error } = await window.supabase
+                    .from('complaints')
+                    .select('*')
+                    .eq('user_id', window.userId)
+                    .order('submitted_at', { ascending: false });
+
+                if (error) throw error;
+
+                if (data.length === 0) {
+                    listContainer.innerHTML = '<div class="text-center py-8 text-gray-500">No complaints found.</div>';
+                    return;
+                }
+
+                listContainer.innerHTML = data.map(c => {
+                    const date = new Date(c.submitted_at).toLocaleDateString();
+                    const statusColor = getStatusColor(c.status);
+                    const resolutionHtml = c.resolution_notes ? 
+                        `<div class="mt-3 bg-gray-50 p-3 rounded text-sm border-l-4 border-indigo-500">
+                            <span class="font-bold text-indigo-700">Admin Resolution:</span> ${c.resolution_notes}
+                         </div>` : '';
+
+                    return `
+                        <div class="p-4 border-b border-gray-200 bg-white">
+                            <div class="flex justify-between items-center mb-2">
+                                <h3 class="text-lg font-semibold text-indigo-700">${c.title}</h3>
+                                <span class="px-3 py-1 text-sm font-medium rounded-full ${statusColor}">${c.status}</span>
+                            </div>
+                            <p class="text-sm text-gray-600 mb-2">${c.description}</p>
+                            <div class="text-xs text-gray-400 flex justify-between items-center">
+                                <span>ID: ${c.complaint_id} | Cat: ${c.category}</span>
+                                <span>${date}</span>
+                            </div>
+                            ${resolutionHtml}
+                            
+                            <div class="mt-4 pt-2 border-t border-gray-100 flex justify-end">
+                                <button onclick="deleteComplaint('${c.id}')" class="flex items-center space-x-1 text-sm text-red-500 hover:text-red-700 font-medium transition-colors">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                    </svg>
+                                    <span>Delete Complaint</span>
+                                </button>
+                            </div>
+                        </div>`;
+                }).join('');
+
+            } catch (e) {
+                listContainer.innerHTML = `<div class="text-red-500">Error: ${e.message}</div>`;
+            }
+        };
+
+        function getStatusColor(status) {
+            const map = {
+                'Pending Review': 'bg-yellow-100 text-yellow-800',
+                'In Progress': 'bg-blue-100 text-blue-800',
+                'Resolved': 'bg-green-100 text-green-800',
+                'Rejected': 'bg-red-100 text-red-800'
+            };
+            return map[status] || 'bg-gray-100 text-gray-800';
+        }
+
+        // --- ADMIN MODULE IMPLEMENTATION (US12 - US18) ---
+
+        window.loadAllComplaints = async function() {
+            const tbody = document.getElementById('admin-complaints-body');
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4">Loading master list...</td></tr>';
+
+            try {
+                const { data, error } = await window.supabase
+                    .from('complaints')
+                    .select('*')
+                    .order('submitted_at', { ascending: false });
+
+                if (error) throw error;
+
+                window.allComplaintsCache = data; 
+                window.applyFilters(); 
+
+            } catch (e) {
+                console.error(e);
+                tbody.innerHTML = `<tr><td colspan="5" class="text-center py-4 text-red-500">Error loading data: ${e.message}</td></tr>`;
+            }
+        };
+
+        window.applyFilters = function() {
+            const search = document.getElementById('admin-search').value.toLowerCase();
+            const catFilter = document.getElementById('admin-filter-category').value;
+            const statusFilter = document.getElementById('admin-filter-status').value;
+
+            const filtered = window.allComplaintsCache.filter(c => {
+                const matchesText = c.title.toLowerCase().includes(search) || 
+                                    c.description.toLowerCase().includes(search) ||
+                                    c.complaint_id.toLowerCase().includes(search);
+                const matchesCat = catFilter === '' || c.category === catFilter;
+                const matchesStatus = statusFilter === '' || c.status === statusFilter;
+                return matchesText && matchesCat && matchesStatus;
+            });
+
+            window.renderAdminTable(filtered);
+        };
+
+        window.renderAdminTable = function(data) {
+            const tbody = document.getElementById('admin-complaints-body');
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-gray-500">No matching records found.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = data.map(c => `
+                <tr class="hover:bg-gray-50 border-b">
+                    <td class="px-4 py-3 text-sm text-gray-900 font-mono">${c.complaint_id}</td>
+                    <td class="px-4 py-3 text-sm text-gray-900 font-semibold">${c.title}</td>
+                    <td class="px-4 py-3 text-sm text-gray-500">${c.category}</td>
+                    <td class="px-4 py-3 text-sm">
+                        <span class="px-2 py-1 rounded-full text-xs font-medium ${getStatusColor(c.status)}">
+                            ${c.status}
+                        </span>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-right">
+                        <button onclick="openComplaintDetails('${c.id}')" class="text-indigo-600 hover:text-indigo-900 font-medium">View / Action</button>
+                    </td>
+                </tr>
+            `).join('');
+        };
+
+        window.openComplaintDetails = function(recordId) {
+            const record = window.allComplaintsCache.find(c => c.id === recordId);
+            if (!record) return;
+
+            // Populate Read-Only Data
+            document.getElementById('modal-id').textContent = record.complaint_id;
+            document.getElementById('modal-title').textContent = record.title;
+            document.getElementById('modal-cat').textContent = record.category;
+            document.getElementById('modal-desc').textContent = record.description;
+            document.getElementById('modal-date').textContent = new Date(record.submitted_at).toLocaleString();
+            
+            // NEW: Populate Student Name and Email in Modal
+            document.getElementById('modal-student-name').textContent = record.student_name || 'N/A';
+            document.getElementById('modal-student-email').textContent = record.student_email || 'N/A';
+
+            // Populate Form (US16)
+            const statusSelect = document.getElementById('admin-update-status');
+            statusSelect.value = record.status;
+            
+            // Populate Notes (US17)
+            const notesArea = document.getElementById('admin-notes');
+            notesArea.value = record.resolution_notes || '';
+            
+            // Store record ID for the update function
+            document.getElementById('modal-record-uuid').value = record.id;
+
+            // Check Resolution Requirements
+            window.checkResolutionRequirement();
+
+            // Show Modal
+            document.getElementById('admin-modal').classList.remove('hidden');
+        };
+
+        window.closeAdminModal = function() {
+            document.getElementById('admin-modal').classList.add('hidden');
+        };
+
+        window.checkResolutionRequirement = function() {
+            const status = document.getElementById('admin-update-status').value;
+            const notesArea = document.getElementById('admin-notes');
+            const infoText = document.getElementById('notes-requirement-text');
+
+            // US17: Mandatory notes for Resolved/Rejected
+            if (status === 'Resolved' || status === 'Rejected') {
+                notesArea.required = true;
+                infoText.textContent = '* Required for this status';
+                infoText.classList.remove('hidden');
+            } else {
+                notesArea.required = false;
+                infoText.classList.add('hidden');
+            }
+        };
+
+        window.updateComplaintStatus = async function(event) {
+            event.preventDefault();
+            
+            const id = document.getElementById('modal-record-uuid').value;
+            const newStatus = document.getElementById('admin-update-status').value;
+            const newNotes = document.getElementById('admin-notes').value.trim();
+            const btn = event.target.querySelector('button[type="submit"]');
+
+            btn.textContent = "Saving...";
+            btn.disabled = true;
+
+            try {
+                // Validate Resolution Notes Logic again
+                if ((newStatus === 'Resolved' || newStatus === 'Rejected') && newNotes.length < 5) {
+                    throw new Error("Resolution notes are required for Resolved/Rejected status.");
+                }
+
+                // Supabase Update
+                const { error } = await window.supabase
+                    .from('complaints')
+                    .update({
+                        status: newStatus,
+                        resolution_notes: newNotes
+                    })
+                    .eq('id', id);
+
+                if (error) throw error;
+
+                // Update Local Cache & UI
+                const index = window.allComplaintsCache.findIndex(c => c.id === id);
+                if (index !== -1) {
+                    window.allComplaintsCache[index].status = newStatus;
+                    window.allComplaintsCache[index].resolution_notes = newNotes;
+                }
+                
+                window.applyFilters(); // Refresh table
+                window.closeAdminModal();
+                alert("Complaint updated successfully.");
+
+            } catch (e) {
+                alert(`Error updating: ${e.message}`);
+            } finally {
+                btn.textContent = "Update Status";
+                btn.disabled = false;
+            }
+        };
+
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen flex flex-col items-center text-gray-800">
+
+    <div id="loading-overlay" class="fixed inset-0 z-50 flex items-center justify-center bg-gray-900 bg-opacity-90">
+        <div class="text-center">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-500 mx-auto"></div>
+            <p id="loading-message" class="mt-4 text-white text-lg">Initializing System...</p>
+        </div>
+    </div>
+
+    <header class="w-full bg-white shadow-md p-4 flex justify-between items-center sticky top-0 z-40">
+        <div class="flex items-center space-x-3">
+            <img src="logo.png" alt="SCMS Logo" class="h-10 w-10 rounded-full">
+            <h1 class="text-2xl font-bold text-indigo-700">SCMS</h1>
+        </div>
+
+        <div id="login-register-links" class="flex space-x-4">
+            <button onclick="showView('login')" class="text-indigo-600 hover:text-indigo-800 font-semibold">Login</button>
+            <button onclick="showView('register')" class="text-indigo-600 hover:text-indigo-800 font-semibold">Register</button>
+        </div>
+
+        <div id="user-actions-links" class="hidden flex items-center space-x-4">
+            
+            <div id="student-nav-links" class="flex">
+                <button onclick="showView('complaint-form')" class="text-indigo-600 hover:text-indigo-800 font-semibold border-r px-3">Submit New</button>
+                <button onclick="showView('view-complaints')" class="text-indigo-600 hover:text-indigo-800 font-semibold border-r px-3">My Complaints</button>
+            </div>
+
+            <div id="admin-nav-links" class="hidden flex">
+                <button onclick="showView('admin-dashboard')" class="text-indigo-600 hover:text-indigo-800 font-bold border-r px-3">Admin Dashboard</button>
+            </div>
+
+            <p class="text-sm font-semibold text-gray-700 ml-2">User: <span id="header-user-id" class="text-indigo-600">...</span></p>
+            <button onclick="logOut()" class="bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600 text-sm ml-2">Log Out</button>
+        </div>
+    </header>
+
+    <main class="w-full p-4 flex justify-center items-start pt-8">
+
+        <div id="login" class="app-view hidden w-full max-w-md">
+            <div class="card bg-white p-8 rounded-xl shadow-2xl border border-gray-200">
+                <h2 class="text-3xl font-extrabold text-gray-800 mb-6 text-center">System Login</h2>
+                <div id="login-message" class="mb-4"></div>
+                <form onsubmit="handleLogin(event)">
+                    <div class="mb-5">
+                        <label for="login-id" class="block text-sm font-medium text-gray-700 mb-1">Student ID or Admin Email</label>
+                        <input type="text" id="login-id" class="w-full px-4 py-3 border border-gray-300 rounded-lg" placeholder="22I-1234 OR admin@uni.edu" required>
+                        <p class="mt-2 text-xs text-gray-500">Students: Use ID format (e.g., 22I-1234). Admins: Use email.</p>
+                    </div>
+                    <div class="mb-6">
+                        <label for="login-password" class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                        <input type="password" id="login-password" class="w-full px-4 py-3 border border-gray-300 rounded-lg" placeholder="••••••••" required>
+                    </div>
+                    <button type="submit" class="w-full bg-indigo-600 text-white font-bold py-3 rounded-xl hover:bg-indigo-700 shadow-lg">Log In</button>
+                    <p class="text-center mt-4 text-sm text-gray-600">Student? <button type="button" onclick="showView('register')" class="text-indigo-600 font-semibold hover:underline">Register Here</button></p>
+                </form>
+            </div>
+        </div>
+
+        <div id="register" class="app-view hidden w-full max-w-md">
+            <div class="card bg-white p-8 rounded-xl shadow-2xl border border-gray-200">
+                <h2 class="text-3xl font-extrabold text-gray-800 mb-6 text-center">Student Registration</h2>
+                <div id="register-message" class="mb-4"></div>
+                <form id="register-form-content" onsubmit="handleRegister(event)">
+                    <div class="mb-4">
+                        <label for="reg-name" class="block text-sm font-medium text-gray-700 mb-1">Full Name</label>
+                        <input type="text" id="reg-name" class="w-full px-4 py-3 border border-gray-300 rounded-lg" placeholder="John Doe" required>
+                    </div>
+                    <div class="mb-4">
+                        <label for="reg-id" class="block text-sm font-medium text-gray-700 mb-1">Student ID</label>
+                        <input type="text" id="reg-id" class="w-full px-4 py-3 border border-gray-300 rounded-lg" placeholder="22I-1234" required>
+                    </div>
+                    <div class="mb-6">
+                        <label for="reg-password" class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                        <input type="password" id="reg-password" class="w-full px-4 py-3 border border-gray-300 rounded-lg" placeholder="••••••••" required>
+                    </div>
+                    <button type="submit" class="w-full bg-green-600 text-white font-bold py-3 rounded-xl hover:bg-green-700 shadow-lg">Register</button>
+                    <p class="text-center mt-4 text-sm text-gray-600">Already registered? <button type="button" onclick="showView('login')" class="text-indigo-600 font-semibold hover:underline">Log In</button></p>
+                </form>
+            </div>
+        </div>
+
+        <div id="complaint-form" class="app-view hidden w-full max-w-3xl">
+            <div class="card bg-white p-8 rounded-xl shadow-2xl border border-gray-200 w-full">
+                <h2 class="text-3xl font-extrabold text-gray-800 mb-2">Submit New Complaint</h2>
+                <p class="text-sm font-mono text-gray-500 mb-4">User ID: <span id="display-user-id" class="font-semibold text-indigo-600">...</span></p>
+                <div id="complaint-message" class="mb-6"></div>
+                <form id="complaint-form-content" onsubmit="handleSubmitComplaint(event)">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                        <div>
+                            <label for="complaintTitle" class="block text-sm font-medium text-gray-700 mb-1">Title *</label>
+                            <input type="text" id="complaintTitle" class="w-full px-4 py-3 border border-gray-300 rounded-lg" required>
+                        </div>
+                        <div>
+                            <label for="complaintCategory" class="block text-sm font-medium text-gray-700 mb-1">Category *</label>
+                            <select id="complaintCategory" class="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white" required>
+                                <option value="">--- Select ---</option>
+                                <option value="academic">Academic</option>
+                                <option value="facilities">Facilities</option>
+                                <option value="financial">Financial</option>
+                                <option value="security">Security</option>
+                                <option value="staff">Staff</option>
+                                <option value="other">Other</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="mb-6">
+                        <label for="complaintDescription" class="block text-sm font-medium text-gray-700 mb-1">Description (min 50 chars) *</label>
+                        <textarea id="complaintDescription" rows="6" minlength="50" class="w-full px-4 py-3 border border-gray-300 rounded-lg" required></textarea>
+                    </div>
+                    <button type="submit" class="w-full bg-indigo-600 text-white font-bold py-3 rounded-xl hover:bg-indigo-700 shadow-lg">Submit</button>
+                </form>
+            </div>
+        </div>
+
+        <div id="view-complaints" class="app-view hidden w-full max-w-3xl">
+            <div class="card bg-white p-8 rounded-xl shadow-2xl border border-gray-200 w-full">
+                <h2 class="text-3xl font-extrabold text-gray-800 mb-6">My Complaints</h2>
+                <div id="complaints-list-container" class="space-y-4">
+                    </div>
+            </div>
+        </div>
+
+        <div id="admin-dashboard" class="app-view hidden w-full max-w-6xl px-4">
+            <div class="bg-white rounded-xl shadow-xl border border-gray-200 overflow-hidden">
+                
+                <div class="p-6 bg-gray-50 border-b border-gray-200">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-2xl font-bold text-gray-800">Admin Dashboard: Master Complaint List</h2>
+                        <button onclick="loadAllComplaints()" class="text-sm bg-white border px-3 py-1 rounded hover:bg-gray-100">↻ Refresh</button>
+                    </div>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <input type="text" id="admin-search" onkeyup="applyFilters()" 
+                               class="w-full px-4 py-2 border rounded-lg" placeholder="Search ID, Title or content...">
+                        
+                        <select id="admin-filter-category" onchange="applyFilters()" class="w-full px-4 py-2 border rounded-lg bg-white">
+                            <option value="">All Categories</option>
+                            <option value="academic">Academic</option>
+                            <option value="facilities">Facilities</option>
+                            <option value="financial">Financial</option>
+                            <option value="security">Security</option>
+                            <option value="staff">Staff</option>
+                            <option value="other">Other</option>
+                        </select>
+
+                        <select id="admin-filter-status" onchange="applyFilters()" class="w-full px-4 py-2 border rounded-lg bg-white">
+                            <option value="">All Statuses</option>
+                            <option value="Pending Review">Pending Review</option>
+                            <option value="In Progress">In Progress</option>
+                            <option value="Resolved">Resolved</option>
+                            <option value="Rejected">Rejected</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead class="bg-gray-100 text-gray-600 text-xs uppercase font-bold">
+                            <tr>
+                                <th class="px-4 py-3 border-b">Complaint ID</th>
+                                <th class="px-4 py-3 border-b">Title</th>
+                                <th class="px-4 py-3 border-b">Category</th>
+                                <th class="px-4 py-3 border-b">Status</th>
+                                <th class="px-4 py-3 border-b text-right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admin-complaints-body" class="divide-y divide-gray-200">
+                            </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <div id="admin-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 p-4">
+        <div class="bg-white rounded-lg shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+            <div class="p-6">
+                <div class="flex justify-between items-start mb-4">
+                    <h3 class="text-xl font-bold text-gray-900">Complaint Details</h3>
+                    <button onclick="closeAdminModal()" class="text-gray-500 hover:text-gray-700 text-2xl">&times;</button>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4 text-sm mb-4 bg-gray-50 p-4 rounded">
+                    <div><span class="font-bold">ID:</span> <span id="modal-id"></span></div>
+                    <div><span class="font-bold">Category:</span> <span id="modal-cat"></span></div>
+                    <div><span class="font-bold">Student:</span> <span id="modal-student-name"></span></div>
+                    <div><span class="font-bold">Email:</span> <span id="modal-student-email"></span></div>
+                    <div class="col-span-2"><span class="font-bold">Title:</span> <span id="modal-title"></span></div>
+                    <div class="col-span-2"><span class="font-bold">Submitted:</span> <span id="modal-date"></span></div>
+                </div>
+
+                <div class="mb-6">
+                    <p class="text-xs font-bold text-gray-500 uppercase mb-1">Description</p>
+                    <p id="modal-desc" class="text-gray-800 bg-gray-50 p-3 rounded border border-gray-200 text-sm leading-relaxed whitespace-pre-wrap"></p>
+                </div>
+
+                <hr class="my-4">
+
+                <form onsubmit="updateComplaintStatus(event)">
+                    <input type="hidden" id="modal-record-uuid">
+                    
+                    <div class="mb-4">
+                        <label class="block text-sm font-bold text-gray-700 mb-1">Update Status</label>
+                        <select id="admin-update-status" onchange="checkResolutionRequirement()" class="w-full border rounded p-2 bg-white focus:ring-2 focus:ring-indigo-500">
+                            <option value="Pending Review">Pending Review</option>
+                            <option value="In Progress">In Progress</option>
+                            <option value="Resolved">Resolved</option>
+                            <option value="Rejected">Rejected</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-6">
+                        <label class="block text-sm font-bold text-gray-700 mb-1">
+                            Resolution Notes 
+                            <span id="notes-requirement-text" class="text-red-500 text-xs font-normal hidden">* Required</span>
+                        </label>
+                        <textarea id="admin-notes" rows="3" class="w-full border rounded p-2 focus:ring-2 focus:ring-indigo-500" placeholder="Enter details about the resolution or rejection reason..."></textarea>
+                    </div>
+
+                    <div class="flex justify-end space-x-3">
+                        <button type="button" onclick="closeAdminModal()" class="px-4 py-2 border rounded text-gray-700 hover:bg-gray-100">Cancel</button>
+                        <button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 font-bold">Update Status</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
